@@ -136,7 +136,7 @@ def setups(P, device):
         print('\nFirst instance trainYS for second sensor:', trainYS[0,:,1,0])
 
 
-    if getattr(P, "has_closures", False) and hasattr(P, "closure_mask") and P.closure_mask is not None:
+    if P.has_closure_labels:
         trainCXS, trainCYS = getXSYS(P, P.closure_mask, 'TRAIN')
         testCXS,  testCYS  = getXSYS(P, P.closure_mask, 'TEST')
         print('\ntrainCXS.shape', trainCXS.shape)
@@ -200,6 +200,111 @@ def setups(P, device):
         print('\nFor veryfication purposes')
         print('Corresponding first sensor in org order in test', XS_torch_tst_u[0,0,1,:])
         print('Corresponding second sensor in org order in train', XS_torch_train[0,0,1,:])
+    
+
+
+    
+    # ---- Closure labels for ALL splits (train/val/test) ----
+    CXS_trn = CYS_trn = CXS_val_u = CYS_val_u = CXS_val_a = CYS_val_a = None
+    CXS_tst_u = CYS_tst_u = CXS_tst_a = CYS_tst_a = None
+
+    if P.has_closure_labels:
+        # 1) Windowize closures exactly like data
+        trainCXS, trainCYS = getXSYS(P, P.closure_mask, 'TRAIN')  # shapes ~ [B_trainval, 1, N, T_in] / [B_trainval, T_out, N, 1]
+        testCXS,  testCYS  = getXSYS(P, P.closure_mask, 'TEST')
+
+        # 2) Spatial slicing (mirror node splits)
+        # TRAIN/VAL (time) on ALL-NODES TRAIN split
+        CXS_trn = trainCXS[:, :, spatialSplit_allNod.i_trn, :]     # [B_trainval, 1, N_tr, T_in]
+        CYS_trn = trainCYS[:, :, spatialSplit_allNod.i_trn, :]     # [B_trainval, T_out, N_tr, 1]
+
+        # VAL_U / VAL_A (these mirror your XS_torch_val_* node sets)
+        CXS_val_u = trainCXS[:, :, spatialSplit_unseen.i_val, :]   # [B_trainval, 1, N_val_u, T_in]
+        CYS_val_u = trainCYS[:, :, spatialSplit_unseen.i_val, :]
+        CXS_val_a = trainCXS[:, :, spatialSplit_allNod.i_val, :]   # [B_trainval, 1, N_val_a, T_in]
+        CYS_val_a = trainCYS[:, :, spatialSplit_allNod.i_val, :]
+
+        # TEST splits
+        if testCXS is not None:
+            CXS_tst_u = testCXS[:, :, spatialSplit_unseen.i_tst, :]  # [B_test, 1, N_tst_u, T_in]
+            CYS_tst_u = testCYS[:, :, spatialSplit_unseen.i_tst, :]
+            CXS_tst_a = testCXS[:, :, spatialSplit_allNod.i_tst, :]  # [B_test, 1, N_tst_a, T_in]
+            CYS_tst_a = testCYS[:, :, spatialSplit_allNod.i_tst, :]
+            if P.example_verbose:
+                print('\nCXS/CYS TEST split shapes:')
+                print('  CXS_tst_u:', CXS_tst_u.shape, '  CYS_tst_u:', CYS_tst_u.shape)
+                print('  CXS_tst_a:', CXS_tst_a.shape, '  CYS_tst_a:', CYS_tst_a.shape)
+
+        # 3) (IMPORTANT) Temporal sub-splits to align with XS_torch_* tensors
+        # XS_torch_train       corresponds to  trainXS[:P.train_size,  ..., i_trn, :]
+        # XS_torch_train_model corresponds to  trainXS[P.train_size:..., i_trn, :]   (your "B" split in time)
+        # XS_torch_val_*       corresponds to  trainXS[P.train_size:..., i_val/val_a, :]
+        # So we mirror this for closures:
+
+        # a) For TRAIN nodes (i_trn):
+        CXS_torch_trn        = torch.tensor(CXS_trn[:P.train_size, ...])                     # align XS_torch_train
+        CXS_torch_trn_model  = torch.tensor(CXS_trn[P.train_size:P.trainval_size, ...])      # align XS_torch_train_model
+
+        # b) For VAL_U / VAL_A (node sets): use the same temporal cut as XS_torch_val_*
+        CXS_torch_val_u      = torch.tensor(CXS_val_u[P.train_size:P.trainval_size, ...])
+        CXS_torch_val_a      = torch.tensor(CXS_val_a[P.train_size:P.trainval_size, ...])
+
+        # c) TEST splits are already built on TEST windows:
+        CXS_torch_tst_u      = torch.tensor(CXS_tst_u) if CXS_tst_u is not None else None
+        CXS_torch_tst_a      = torch.tensor(CXS_tst_a) if CXS_tst_a is not None else None
+
+        # 4) Keep TIME labels as-is. DO NOT binarize if closure_mode == 'time'.
+        # If you still want binary labels for metrics, create *_bin copies without overwriting originals:
+        want_bin_for_metrics = getattr(P, 'closure_bin_for_metrics', False)
+        if want_bin_for_metrics:
+            def _mk_bin(arr): return None if arr is None else (arr > 0).astype(np.float32)
+            CYS_trn_bin   = _mk_bin(CYS_trn);   CYS_val_u_bin = _mk_bin(CYS_val_u)
+            CYS_val_a_bin = _mk_bin(CYS_val_a); CYS_tst_u_bin = _mk_bin(CYS_tst_u)
+            CYS_tst_a_bin = _mk_bin(CYS_tst_a)
+            # store them on P if you want access later:
+            P.CYS_bin = {
+                'trn': CYS_trn_bin, 'val_u': CYS_val_u_bin, 'val_a': CYS_val_a_bin,
+                'tst_u': CYS_tst_u_bin, 'tst_a': CYS_tst_a_bin
+            }
+
+        if P.example_verbose:
+            print('\n[Closure labels / all splits] (time labels preserved)')
+            for name, obj in [
+                ('CXS_trn', CXS_trn), ('CYS_trn', CYS_trn),
+                ('CXS_val_u', CXS_val_u), ('CYS_val_u', CYS_val_u),
+                ('CXS_val_a', CXS_val_a), ('CYS_val_a', CYS_val_a),
+                ('CXS_tst_u', CXS_tst_u), ('CYS_tst_u', CYS_tst_u),
+                ('CXS_tst_a', CXS_tst_a), ('CYS_tst_a', CYS_tst_a),
+            ]:
+                if obj is not None: print(f'  {name}: {obj.shape}')
+            print('[Closure labels ready]')
+    # ---------------------------------------
+
+    # ---- Concatenate closure channel to all XS_* tensors (aligning temporal and spatial splits) ----
+
+    if P.has_closure_labels and P.add_closure_labels:
+        print("\n[Adding closure channel to inputs]")
+
+        # TRAIN (temporal train slice, train nodes)
+        XS_torch_train       = torch.cat([XS_torch_train,       CXS_torch_trn.to(XS_torch_train.dtype)], dim=1)
+
+        # TRAIN_MODEL (temporal val slice over TRAIN nodes)
+        XS_torch_train_model = torch.cat([XS_torch_train_model, CXS_torch_trn_model.to(XS_torch_train_model.dtype)], dim=1)
+
+        # VAL splits (temporal val slice)
+        XS_torch_val_u       = torch.cat([XS_torch_val_u,       CXS_torch_val_u.to(XS_torch_val_u.dtype)], dim=1)
+        XS_torch_val_a       = torch.cat([XS_torch_val_a,       CXS_torch_val_a.to(XS_torch_val_a.dtype)], dim=1)
+
+        # TEST splits
+        if XS_torch_tst_u is not None and CXS_torch_tst_u is not None:
+            XS_torch_tst_u   = torch.cat([XS_torch_tst_u,       CXS_torch_tst_u.to(XS_torch_tst_u.dtype)], dim=1)
+        if XS_torch_tst_a is not None and CXS_torch_tst_a is not None:
+            XS_torch_tst_a   = torch.cat([XS_torch_tst_a,       CXS_torch_tst_a.to(XS_torch_tst_a.dtype)], dim=1)
+
+        # Increase input channel count
+        P.n_channel += 1
+        print(f"Input channels increased to {P.n_channel}")
+
     # torch dataset
     train_data = torch.utils.data.TensorDataset(XS_torch_train, YS_torch_train)
     train_model_data = torch.utils.data.TensorDataset(XS_torch_train_model, YS_torch_train_model)
@@ -214,71 +319,6 @@ def setups(P, device):
     val_a_iter = torch.utils.data.DataLoader(val_a_data, P.batch_size, shuffle=False)
     tst_u_iter = torch.utils.data.DataLoader(tst_u_data, P.batch_size, shuffle=False)
     tst_a_iter = torch.utils.data.DataLoader(tst_a_data, P.batch_size, shuffle=False)
-
-
-    
-    # ---- Closure labels for ALL splits (train/val/test) ----
-    CXS_trn = CYS_trn = CXS_val_u = CYS_val_u = CXS_val_a = CYS_val_a = None
-    CXS_tst_u = CYS_tst_u = CXS_tst_a = CYS_tst_a = None
-
-    if getattr(P, "has_closures", False) and hasattr(P, "closure_mask") and P.closure_mask is not None:
-        # Windowize the closure mask exactly like data
-        trainCXS, trainCYS = getXSYS(P, P.closure_mask, 'TRAIN')
-        testCXS,  testCYS  = getXSYS(P, P.closure_mask, 'TEST')
-
-        # ---- TRAIN/VAL splits (mirror XS/YS slicing) ----
-        # train set = spatialSplit_allNod.i_trn
-        CXS_trn = trainCXS[:, :, spatialSplit_allNod.i_trn, :]   # [B_tr, 1, N_tr, T_in]
-        CYS_trn = trainCYS[:, :, spatialSplit_allNod.i_trn, :]   # [B_tr, T_out, N_tr, 1]
-
-        # val_u = unseen nodes; val_a = all nodes’ val slice
-        CXS_val_u = trainCXS[:, :, spatialSplit_unseen.i_val, :]
-        CYS_val_u = trainCYS[:, :, spatialSplit_unseen.i_val, :]
-        CXS_val_a = trainCXS[:, :, spatialSplit_allNod.i_val, :]
-        CYS_val_a = trainCYS[:, :, spatialSplit_allNod.i_val, :]
-
-        # ---- TEST splits (your original block, kept verbatim) ----
-        if 'testCXS' in locals() and testCXS is not None:
-            # unseen split
-            CXS_tst_u = testCXS[:, :, spatialSplit_unseen.i_tst, :]  # [B_te_u, 1, N_u, T_in]
-            CYS_tst_u = testCYS[:, :, spatialSplit_unseen.i_tst, :]  # [B_te_u, T_out, N_u, 1]
-            # all-nodes split
-            CXS_tst_a = testCXS[:, :, spatialSplit_allNod.i_tst, :]  # [B_te_a, 1, N_a, T_in]
-            CYS_tst_a = testCYS[:, :, spatialSplit_allNod.i_tst, :]  # [B_te_a, T_out, N_a, 1]
-            if P.example_verbose:
-                print('\nCXS/CYS TEST split shapes:')
-                print('  CXS_tst_u:', CXS_tst_u.shape, '  CYS_tst_u:', CYS_tst_u.shape)
-                print('  CXS_tst_a:', CXS_tst_a.shape, '  CYS_tst_a:', CYS_tst_a.shape)
-        else:
-            CXS_tst_u = CYS_tst_u = CXS_tst_a = CYS_tst_a = None
-
-        # ---- Optional: binarize if closure_mode == 'time' (pos->1, non-pos->0) ----
-        if getattr(P, 'closure_mode', 'binary') == 'time':
-            def _binarize(arr):
-                if arr is None: return None
-                # Only binarize Y windows (CYS_*); X windows (CXS_*) are not used in metrics right now
-                return (arr > 0).astype(np.float32)
-
-            CYS_trn   = _binarize(CYS_trn)
-            CYS_val_u = _binarize(CYS_val_u)
-            CYS_val_a = _binarize(CYS_val_a)
-            CYS_tst_u = _binarize(CYS_tst_u)
-            CYS_tst_a = _binarize(CYS_tst_a)
-
-        if P.example_verbose:
-            print('\n[Closure labels / all splits]')
-            for name, obj in [
-                ('CXS_trn', CXS_trn), ('CYS_trn', CYS_trn),
-                ('CXS_val_u', CXS_val_u), ('CYS_val_u', CYS_val_u),
-                ('CXS_val_a', CXS_val_a), ('CYS_val_a', CYS_val_a),
-                ('CXS_tst_u', CXS_tst_u), ('CYS_tst_u', CYS_tst_u),
-                ('CXS_tst_a', CXS_tst_a), ('CYS_tst_a', CYS_tst_a),
-            ]:
-                if obj is not None: print(f'  {name}: {obj.shape}')
-            print('[Closure labels ready]')
-    # ---------------------------------------
-
-
 
 
 
@@ -322,12 +362,23 @@ def setups(P, device):
     Both of them should have dimension [number_of_sensor, timestamp]
     '''
     pretrn_iter = torch.utils.data.DataLoader(
-    torch.utils.data.TensorDataset(
-        XS_torch_train[:,-1,:,0].T), batch_size=1, shuffle=True)
+        torch.utils.data.TensorDataset(
+            XS_torch_train[:, 0, :, 0].T  # [N_tr, B_tr]
+        ),
+        batch_size=1,
+        shuffle=True
+    )
+
     preval_iter = torch.utils.data.DataLoader(
-    torch.utils.data.TensorDataset(
-        torch.tensor(XS_torch_trn[:,-1,spatialSplit_allNod.i_val,0]).T.float()),
-    batch_size=1, shuffle=False)
+        torch.utils.data.TensorDataset(
+            torch.tensor(
+                XS_torch_trn[:, 0, spatialSplit_allNod.i_val, 0]  # [B_tr, N_val]
+            ).T.float()  # [N_val, B_tr]
+        ),
+        batch_size=1,
+        shuffle=False
+    )
+
     print('\npretrn_iter.dataset.tensors[0].shape', pretrn_iter.dataset.tensors[0].shape)
     print('preval_iter.dataset.tensors[0].shape', preval_iter.dataset.tensors[0].shape)
     if P.example_verbose:
@@ -882,7 +933,7 @@ def testModel(P, name, mode, test_iter, adj_tst, spatialsplit, device_cpu, devic
     print('Model Testing Ended ...', time.ctime())
 
     # ---- Closure-aware metrics (NO BLENDING; use raw predictions) ----
-    if CYS_tst is not None:
+    if P.has_closure_labels:
         # Align closure labels to the same sensor slice used in loss/eval
         from closures import align_cys_for_eval  # keep only this import from closures.py
         CYS_aligned, split_indices_aligned = align_cys_for_eval(
@@ -1096,11 +1147,12 @@ def main(P):
             P.adj_path = './data/SIM_GRID/5DAY_NOC/adj_mx_diag1.pkl'
         P.n_sensor = 120
         data = pd.read_hdf(data_path).values
-        P.has_closures = True
+        P.has_closure_labels = True
         P.closure_mask_path = './data/SIM_GRID/5DAY_NOC/closure_labels.h5' 
         closure_mask = pd.read_hdf(P.closure_mask_path).values
         P.closure_mask = closure_mask     
         P.effect_matrix_path = './data/SIM_GRID/5DAY_NOC/closure_effect.pkl' 
+        P.closure_mode = 'binary'   # 'time' or 'binary' 
     elif P.dataname == 'SIM_GRID_5DAY_C':
         print('P.dataname == SIM_GRID_5DAY_C')
         data_path = './data/SIM_GRID/5DAY_C/sensor_readings.h5'
@@ -1110,11 +1162,12 @@ def main(P):
             P.adj_path = './data/SIM_GRID/5DAY_C/adj_mx_diag1.pkl'
         P.n_sensor = 120
         data = pd.read_hdf(data_path).values
-        P.has_closures = True
+        P.has_closure_labels = True
         P.closure_mask_path = './data/SIM_GRID/5DAY_C/closure_labels.h5' 
         closure_mask = pd.read_hdf(P.closure_mask_path).values
         P.closure_mask = closure_mask     
         P.effect_matrix_path = './data/SIM_GRID/5DAY_C/closure_effect.pkl' 
+        P.closure_mode = 'binary'   # 'time' or 'binary' 
     elif P.dataname == 'SIM_GRID_5DAY_COT':
         print('P.dataname == OT')
         data_path = './data/SIM_GRID/5DAY_COT/sensor_readings.h5'
@@ -1124,11 +1177,12 @@ def main(P):
             P.adj_path = './data/SIM_GRID/5DAY_COT/adj_mx_diag1.pkl'
         P.n_sensor = 120
         data = pd.read_hdf(data_path).values
-        P.has_closures = True
+        P.has_closure_labels = True
         P.closure_mask_path = './data/SIM_GRID/5DAY_COT/closure_labels.h5' 
         closure_mask = pd.read_hdf(P.closure_mask_path).values
         P.closure_mask = closure_mask     
-        P.effect_matrix_path = './data/SIM_GRID/5DAY_COT/closure_effect.pkl' 
+        P.effect_matrix_path = './data/SIM_GRID/5DAY_COT/closure_effect.pkl'
+        P.closure_mode = 'binary'   # 'time' or 'binary' 
     elif P.dataname == 'HAGUE_FULL':
         print('P.dataname == HAGUE_FULL')
         data_path = './data/Hauge/hague_filled.h5'

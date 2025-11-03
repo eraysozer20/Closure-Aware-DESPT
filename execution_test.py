@@ -50,12 +50,9 @@ for i in range(1):
     P.is_always_augmentation = False # set to best after tuning
 
     # --- closures inputs (step 1: declare only; no loading yet) ---
-    P.has_closures = True                 # keep False unless this dataset has closures
-    P.closure_mask_path = ""               # e.g., "./data/Hague/closures.h5"
-    P.effect_matrix_path = ""              # e.g., "./data/Hague/effect_matrix.npy"
+    P.add_closure_labels = False
     P.most_top_frac = 0.05            # top 5% farthest from 1.0
     P.include_closed_in_most = True   # allow the closed sensors themselves to be in “most”
-    P.closure_mode = 'time'   # 'time' or 'binary'
     
     # ----------------------------------------------------------------
 
@@ -64,7 +61,7 @@ for i in range(1):
     P.pretrain_epoch = 5 #100
     P.train_epoch = 5 #100
     P.weight_decay = 0
-    P.is_testunseen = True
+    P.is_testunseen = False
     P.train_model_datasplit = 'B'
     P.train_encoder_on = 'cpu'
 
