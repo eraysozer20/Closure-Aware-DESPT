@@ -1168,6 +1168,21 @@ def main(P):
         P.closure_mask = closure_mask     
         P.effect_matrix_path = './data/SIM_GRID/5DAY_C/closure_effect.pkl' 
         P.closure_mode = 'binary'   # 'time' or 'binary' 
+    elif P.dataname == 'SIM_GRID_2MON_C':
+        print('P.dataname == SIM_GRID_2MON_C')
+        data_path = './data/SIM_GRID/2MON_C/sensor_readings.h5'
+        if P.adj_method == 0:
+            P.adj_path = './data/SIM_GRID/2MON_C/adj_mx_diag0.pkl'
+        elif P.adj_method == 1:
+            P.adj_path = './data/SIM_GRID/2MON_C/adj_mx_diag1.pkl'
+        P.n_sensor = 120
+        data = pd.read_hdf(data_path).values
+        P.has_closure_labels = True
+        P.closure_mask_path = './data/SIM_GRID/2MON_C/closure_labels.h5' 
+        closure_mask = pd.read_hdf(P.closure_mask_path).values
+        P.closure_mask = closure_mask     
+        P.effect_matrix_path = './data/SIM_GRID/2MON_C/closure_effect.pkl' 
+        P.closure_mode = 'time'   # 'time' or 'binary' 
     elif P.dataname == 'SIM_GRID_5DAY_COT':
         print('P.dataname == OT')
         data_path = './data/SIM_GRID/5DAY_COT/sensor_readings.h5'
