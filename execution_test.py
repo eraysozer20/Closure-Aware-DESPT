@@ -53,6 +53,11 @@ for i in range(1):
     P.add_closure_labels = False
     P.most_top_frac = 0.05            # top 5% farthest from 1.0
     P.include_closed_in_most = True   # allow the closed sensors themselves to be in “most”
+    P.use_closure_loss     = False
+    P.tau = 10.0
+    P.beta = 2.0
+    P.use_soft = "closure_weight_soft"
+
     
     # ----------------------------------------------------------------
 

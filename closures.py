@@ -34,7 +34,6 @@ def load_and_slice_effect(effect_matrix_path: str,
     Returns: torch.float32 [N_split, N_split] on device, or None on failure.
     """
     if not effect_matrix_path:
-        print('[closures] effect: no path provided')
         return None
     try:
         with open(effect_matrix_path, 'rb') as f:
@@ -42,23 +41,18 @@ def load_and_slice_effect(effect_matrix_path: str,
 
         if isinstance(obj, dict) and 'matrix' in obj:
             A_full = np.array(obj['matrix'])
-            print('[closures] effect: dict payload with matrix shape:', A_full.shape)
         else:
             A_full = np.array(obj)
-            print('[closures] effect: array payload shape:', A_full.shape)
 
         if A_full.ndim != 2 or A_full.shape[0] != A_full.shape[1]:
-            print(f'[closures] effect: expected square 2D array, got {A_full.shape}; returning None.')
             return None
 
         idx = np.asarray(sensor_indices, dtype=int)
         A = torch.as_tensor(A_full, dtype=torch.float32, device=device)
         A = A.index_select(0, torch.as_tensor(idx, dtype=torch.long, device=device))
         A = A.index_select(1, torch.as_tensor(idx, dtype=torch.long, device=device))
-        print('[closures] effect: sliced to split shape:', tuple(A.shape))
         return A
     except Exception as e:
-        print('[closures] effect: failed to load/slice:', repr(e))
         return None
 
 
@@ -152,9 +146,6 @@ def evaluate_closure_metrics(y_true: torch.Tensor,
         res = Metrics.evaluate_masked(y_true, y_pred, m)  # uses your base Metrics
         out[key] = res
 
-        # debug counts
-        cnt = int(m.sum().item())
-        print(f'[closures] mask "{key}": count={cnt}, shape={tuple(m.shape)}')
 
     return out
 

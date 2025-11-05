@@ -207,6 +207,10 @@ def setups(P, device):
     # ---- Closure labels for ALL splits (train/val/test) ----
     CXS_trn = CYS_trn = CXS_val_u = CYS_val_u = CXS_val_a = CYS_val_a = None
     CXS_tst_u = CYS_tst_u = CXS_tst_a = CYS_tst_a = None
+    CYS_torch_train = CYS_torch_train_model = None
+    CYS_torch_val_u = CYS_torch_val_a = None
+    CYS_torch_tst_u = CYS_torch_tst_a = None
+
 
     if P.has_closure_labels:
         # 1) Windowize closures exactly like data
@@ -267,6 +271,19 @@ def setups(P, device):
                 'tst_u': CYS_tst_u_bin, 'tst_a': CYS_tst_a_bin
             }
 
+        # TRAIN nodes (i_trn) with temporal train slice
+        CYS_torch_train       = torch.tensor(CYS_trn[:P.train_size, ...])                 # matches YS_torch_train
+        # TRAIN_MODEL = temporal val slice over TRAIN nodes
+        CYS_torch_train_model = torch.tensor(CYS_trn[P.train_size:P.trainval_size, ...])  # matches YS_torch_train_model
+
+        # VAL splits (temporal val slice)
+        CYS_torch_val_u = torch.tensor(CYS_val_u[P.train_size:P.trainval_size, ...])      # matches YS_torch_val_u
+        CYS_torch_val_a = torch.tensor(CYS_val_a[P.train_size:P.trainval_size, ...])      # matches YS_torch_val_a
+
+        # TEST splits
+        CYS_torch_tst_u = torch.tensor(CYS_tst_u) if CYS_tst_u is not None else None      # matches YS_torch_tst_u
+        CYS_torch_tst_a = torch.tensor(CYS_tst_a) if CYS_tst_a is not None else None      # matches YS_torch_tst_a
+
         if P.example_verbose:
             print('\n[Closure labels / all splits] (time labels preserved)')
             for name, obj in [
@@ -305,20 +322,27 @@ def setups(P, device):
         P.n_channel += 1
         print(f"Input channels increased to {P.n_channel}")
 
-    # torch dataset
-    train_data = torch.utils.data.TensorDataset(XS_torch_train, YS_torch_train)
-    train_model_data = torch.utils.data.TensorDataset(XS_torch_train_model, YS_torch_train_model)
-    val_u_data = torch.utils.data.TensorDataset(XS_torch_val_u, YS_torch_val_u)
-    val_a_data = torch.utils.data.TensorDataset(XS_torch_val_a, YS_torch_val_a)
-    tst_u_data = torch.utils.data.TensorDataset(XS_torch_tst_u, YS_torch_tst_u)
-    tst_a_data = torch.utils.data.TensorDataset(XS_torch_tst_a, YS_torch_tst_a)
-    # torch dataloader
-    train_iter = torch.utils.data.DataLoader(train_data, P.batch_size, shuffle=False)
-    train_model_iter = torch.utils.data.DataLoader(train_model_data, P.batch_size, shuffle=False)
-    val_u_iter = torch.utils.data.DataLoader(val_u_data, P.batch_size, shuffle=False)
-    val_a_iter = torch.utils.data.DataLoader(val_a_data, P.batch_size, shuffle=False)
-    tst_u_iter = torch.utils.data.DataLoader(tst_u_data, P.batch_size, shuffle=False)
-    tst_a_iter = torch.utils.data.DataLoader(tst_a_data, P.batch_size, shuffle=False)
+    # Helper so datasets become (X,Y,CYS) when closures exist, else (X,Y)
+    def _make_ds(X, Y, C):
+        return torch.utils.data.TensorDataset(X, Y, C) if C is not None \
+            else torch.utils.data.TensorDataset(X, Y)
+
+    # ⬇️ Build datasets AFTER you've concatenated the closure X-channel and bumped P.n_channel
+    train_data        = _make_ds(XS_torch_train,       YS_torch_train,       CYS_torch_train)
+    train_model_data  = _make_ds(XS_torch_train_model, YS_torch_train_model, CYS_torch_train_model)
+    val_u_data        = _make_ds(XS_torch_val_u,       YS_torch_val_u,       CYS_torch_val_u)
+    val_a_data        = _make_ds(XS_torch_val_a,       YS_torch_val_a,       CYS_torch_val_a)
+    tst_u_data        = _make_ds(XS_torch_tst_u,       YS_torch_tst_u,       CYS_torch_tst_u)
+    tst_a_data        = _make_ds(XS_torch_tst_a,       YS_torch_tst_a,       CYS_torch_tst_a)
+
+    # DataLoaders
+    train_iter        = torch.utils.data.DataLoader(train_data,        P.batch_size, shuffle=False)
+    train_model_iter  = torch.utils.data.DataLoader(train_model_data,  P.batch_size, shuffle=False)
+    val_u_iter        = torch.utils.data.DataLoader(val_u_data,        P.batch_size, shuffle=False)
+    val_a_iter        = torch.utils.data.DataLoader(val_a_data,        P.batch_size, shuffle=False)
+    tst_u_iter        = torch.utils.data.DataLoader(tst_u_data,        P.batch_size, shuffle=False)
+    tst_a_iter        = torch.utils.data.DataLoader(tst_a_data,        P.batch_size, shuffle=False)
+
 
 
 
@@ -576,7 +600,20 @@ def trainModel(P, name, mode,
     min_val_a_loss = np.inf
     final_train_loss = np.inf
     tolerance = 0
-    criterion = Metrics.MAE
+    beta = getattr(P, "closure_weight_beta", 2.0)
+    tau  = getattr(P, "closure_tau", 10.0)
+    use_soft = getattr(P, "closure_weight_soft", False)
+    if getattr(P, "use_closure_loss", False):
+        if use_soft:
+            def criterion(y_true, y_pred, cys):
+                return Metrics.closure_soft_MAE(y_true, y_pred, cys, beta=beta, tau=tau)
+        else:
+            def criterion(y_true, y_pred, cys):
+                return Metrics.closure_weighted_MAE(y_true, y_pred, cys, beta=beta)
+    else:
+        # baseline: plain MAE, ignore cys
+        def criterion(y_true, y_pred, cys):
+            return Metrics.MAE(y_true, y_pred)
     optimizer = torch.optim.Adam(model.parameters(), lr=P.learn_rate, weight_decay=P.weight_decay)
     s_time = datetime.now()
 
@@ -601,7 +638,7 @@ def trainModel(P, name, mode,
         encoder.eval()
         with torch.no_grad():
             encoder.load_state_dict(torch.load(P.save_path+ '/' + 'encoder' + '.pt'))
-            train_encoder_input = train_iter.dataset.tensors[0][:,-1,:,0].T.to(device_encoder)
+            train_encoder_input = train_iter.dataset.tensors[0][:,0,:,0].T
             val_u_encoder_input = torch.Tensor(data[:P.train_size,spatialSplit_unseen.i_val]).to(device_encoder).float().T
             val_a_encoder_input = torch.Tensor(data[:P.train_size,spatialSplit_allNod.i_val]).to(device_encoder).float().T
             if P.is_always_augmentation:
@@ -661,7 +698,15 @@ def trainModel(P, name, mode,
         starttime = datetime.now()     
         loss_sum, n = 0.0, 0
         model.train()
-        for x, y in model_input:
+        for batch in model_input:
+            # Support both (x,y) and (x,y,cys)
+            if len(batch) == 3:
+                x, y, cys = batch
+                cys = cys.to(device_gpu)
+            else:
+                x, y = batch
+                cys = None
+            
             # Apply prediction
             if P.model == 'gwnet':
                 y_pred = model(x.to(device_gpu), adj_train, train_embed, P.is_concat_encoder_model, P.is_layer_after_concat)
@@ -679,7 +724,7 @@ def trainModel(P, name, mode,
                 print('The corresponding second instance of y', y[0,:,1,0])
             y_pred = scaler.inverse_transform(y_pred)
             y = scaler.inverse_transform(y.to(device_gpu))
-            loss = criterion(y, y_pred)
+            loss = criterion(y, y_pred, cys)
 
             optimizer.zero_grad()
             loss.backward()
@@ -767,40 +812,78 @@ def trainModel(P, name, mode,
     print('trainModel Ended ...\n')
     return model_log, min_val_a_loss
 
-def evaluateModel(P, model, criterion, data_iter, adj, embed, device, sensor_idx_start, test = False):
+def evaluateModel(P, model, criterion_fn, data_iter, adj, embed, device, sensor_idx_start, test=False):
+    """
+    criterion_fn: callable(y_true, y_pred, cys_or_None) -> scalar loss
+    data_iter may yield (x,y) or (x,y,cys)
+    """
     YS_pred = []
     Y = []
     model.eval()
     torch.cuda.empty_cache()
     l_sum, n = 0.0, 0
-    embed_after_index = embed[:,sensor_idx_start:]
+
+    # For LSTM branch you used embed_after_index
+    embed_after_index = embed[:, sensor_idx_start:]
+
     with torch.no_grad():
-        for x, y in data_iter:
+        for batch in data_iter:
+            if len(batch) == 3:
+                x, y, cys = batch
+                cys = cys.to(device)
+            else:
+                x, y = batch
+                cys = None
+
+            # Forward
             if P.model == 'gwnet':
                 y_pred = model(x.to(device), adj, embed, P.is_concat_encoder_model, P.is_layer_after_concat).to(device)
-                y_pred = y_pred[:,:,sensor_idx_start:,]
+                # slice sensors AFTER prediction
+                y_pred = y_pred[:, :, sensor_idx_start:, :]
+                # slice labels (and cys) to match
+                y = y[:, :, sensor_idx_start:, :].to(device)
+                if cys is not None:
+                    cys = cys[:, :, sensor_idx_start:, :]
+
             elif P.model == 'LSTM':
-                x = x[:,:,sensor_idx_start:,].to(device)
-                y_pred = model(x, embed_after_index, P.encoder_to_model_ratio, P.is_concat_encoder_model, support = adj, is_example = P.example_verbose, is_layer_after_concat = P.is_layer_after_concat).to(device)
-            y = y[:,:,sensor_idx_start:,].to(device)
+                # slice inputs before prediction; use sliced embed
+                x = x[:, :, sensor_idx_start:, :].to(device)
+                y_pred = model(
+                    x, embed_after_index, P.encoder_to_model_ratio, P.is_concat_encoder_model,
+                    support=adj, is_example=P.example_verbose, is_layer_after_concat=P.is_layer_after_concat
+                ).to(device)
+                # slice labels (and cys) to match
+                y = y[:, :, sensor_idx_start:, :].to(device)
+                if cys is not None:
+                    cys = cys[:, :, sensor_idx_start:, :]
+
             if P.example_verbose:
                 print('\nIn model evaluation process:')
                 print('The shape of y_pred', y_pred.shape)
                 print('The shape of y', y.shape)
+                if cys is not None:
+                    print('The shape of cys', cys.shape)
+
+            # Inverse-scale in real units **before** loss
             y_pred = scaler.inverse_transform(y_pred)
-            y = scaler.inverse_transform(y.to(device))
-            if test == False:
-                l = criterion(y.to(device), y_pred.to(device))
+            y      = scaler.inverse_transform(y)
+
+            if not test:
+                l = criterion_fn(y, y_pred, cys)
                 l_sum += l.item() * y.shape[0]
                 n += y.shape[0]
+
             Y.append(y)
             YS_pred.append(y_pred)
+
         YS_pred = torch.vstack(YS_pred)
         Y = torch.vstack(Y)
-    if test == False:
-        return l_sum / n, YS_pred, Y
+
+    if not test:
+        return l_sum / max(n, 1), YS_pred, Y
     else:
         return YS_pred, Y
+
 
 def testModel(P, name, mode, test_iter, adj_tst, spatialsplit, device_cpu, device_gpu, mongodb, CXS_tst=None, CYS_tst=None):
 

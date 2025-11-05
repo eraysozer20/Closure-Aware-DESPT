@@ -174,3 +174,43 @@ def evaluate_masked(y_true, y_pred, mask_bool, use_masked_base: bool = True):
         return MSE_all(yt, yp), RMSE_all(yt, yp), MAE_all(yt, yp), MAPE_all(yt, yp)
 
 
+def closure_weighted_MAE(y_true, y_pred, cys=None, beta=2.0, eps=1e-6):
+    """
+    y_true, y_pred, cys: [B, T_out, N, 1]
+    cys: time-valued (<=0 open/approach, >0 closed) or binary (0/1). If None -> plain MAE.
+    beta: extra weight applied on closed steps (cys > 0).
+    """
+    if cys is None:
+        return MAE(y_true, y_pred)
+
+    # weights: 1 for open, 1+beta for closed
+    is_closed = (cys > 0).to(y_true.dtype)
+    w = 1.0 + beta * is_closed
+
+    # normalize to keep average weight ~1 (so loss scale stays comparable)
+    w = w / w.mean().clamp_min(eps)
+
+    return (w * (y_pred - y_true).abs()).mean()
+
+# Optional: a “soft” version that also upweights approaching closures (negative times)
+def closure_soft_MAE(y_true, y_pred, cys=None, beta=2.0, tau=10.0, eps=1e-6):
+    """
+    - cys > 0 (closed): weight = 1 + beta
+    - cys < 0 (approaching): weight rises smoothly as it gets closer (exp(cys/tau))
+    - cys == 0: weight = 1
+    """
+    if cys is None:
+        return MAE(y_true, y_pred)
+
+    cys = cys.to(y_true.dtype)
+    w = torch.ones_like(cys)
+
+    closed = (cys > 0)
+    approaching = (cys < 0)
+
+    w[closed] = 1.0 + beta
+    # closer to 0 (e.g., -2 minutes) → larger exp(-2/tau) than far (-30)
+    w[approaching] = 1.0 + beta * torch.exp(cys[approaching] / tau)
+
+    w = w / w.mean().clamp_min(eps)
+    return (w * (y_pred - y_true).abs()).mean()
