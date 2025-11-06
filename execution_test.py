@@ -68,6 +68,9 @@ for i in range(1):
     # Validation policy
     P.val_use_closure_loss      = False       # validate with plain MAE (recommended)
 
+    P.lambda_effect = 1.0          # strength of effect-matrix term inside the loss
+    P.combine_with_beta = 'mul'     # how beta combines with effect weights: 'mul' | 'sum' | 'max'
+
     
     # ----------------------------------------------------------------
 

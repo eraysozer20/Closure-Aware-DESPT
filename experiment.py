@@ -15,6 +15,7 @@ from closures import (
 )
 import json
 from pymongo import MongoClient, UpdateOne
+import pickle
 
 class StandardScaler:
     def __init__(self):
@@ -176,6 +177,44 @@ def setups(P, device):
         print('spatialSplit_allNod.i_trn', spatialSplit_allNod.i_trn)
         print('spatialSplit_allNod.i_val', spatialSplit_allNod.i_val)
         print('spatialSplit_allNod.i_tst', spatialSplit_allNod.i_tst)
+
+    P.effect_slices = None
+    try:
+        if getattr(P, 'has_closure_labels', False) and hasattr(P, 'effect_matrix_path'):
+            with open(P.effect_matrix_path, 'rb') as fh:
+                eff_obj = pickle.load(fh)
+            if isinstance(eff_obj, dict) and 'matrix' in eff_obj:
+                E_full = eff_obj['matrix']
+            else:
+                E_full = eff_obj
+            E_full = torch.tensor(E_full).float()
+
+            def _submat(rows, cols):
+                return E_full[torch.as_tensor(rows, dtype=torch.long)][:, torch.as_tensor(cols, dtype=torch.long)]
+
+            i_trn = spatialSplit_allNod.i_trn
+            i_val_u = spatialSplit_unseen.i_val
+            i_val_a = spatialSplit_allNod.i_val
+            i_tst_u = spatialSplit_unseen.i_tst
+            i_tst_a = spatialSplit_allNod.i_tst
+
+            P.effect_slices = {
+                'train':  _submat(i_trn,  i_trn),
+                'val_u':  _submat(i_val_u, i_val_u),
+                'val_a':  _submat(i_val_a, i_val_a),
+                'tst_u':  _submat(i_tst_u, i_tst_u),
+                'tst_a':  _submat(i_tst_a, i_tst_a),
+            }
+
+            # ---- Debug prints ----
+            print("\n[Effect matrix slicing results:]")
+            for name, M in P.effect_slices.items():
+                print(f"  {name:<7} shape={tuple(M.shape)}  mean={M.mean():.4f}  std={M.std():.4f}")
+
+    except Exception as e:
+        print("[effect] Could not load/slice effect matrix:", e)
+        P.effect_slices = None
+
     XS_torch_train = torch.Tensor(XS_torch_trn[:,:,spatialSplit_allNod.i_trn,:])
     YS_torch_train = torch.Tensor(YS_torch_trn[:,:,spatialSplit_allNod.i_trn,:])
     XS_torch_train_model = torch.Tensor(XS_torch_val[:,:,spatialSplit_allNod.i_trn,:])
@@ -609,7 +648,17 @@ def trainModel(P, name, mode,
     beta_schedule      = getattr(P, "closure_beta_schedule",  "linear")  # 'linear' | 'exp' | 'step'
     beta_step_epoch    = getattr(P, "closure_beta_step_epoch",  5)       # if 'step', when to jump to beta_end
     val_use_closure    = getattr(P, "val_use_closure_loss", False)       # use closure loss for val or plain MAE
-
+    lambda_effect = getattr(P, 'lambda_effect', 1.0)
+    combine_with_beta = getattr(P, 'combine_with_beta', 'mul')  # 'mul' | 'sum' | 'max'
+    effect_train = None
+    effect_val_a = None
+    if getattr(P, 'use_closure_loss', False) and getattr(P, 'effect_slices', None) is not None:
+        # put on the GPU that runs the predictor
+        effect_train = P.effect_slices.get('train')
+        effect_val_a = P.effect_slices.get('val_a')
+        if effect_train is not None: effect_train = effect_train.to(device_gpu)
+        if effect_val_a is not None: effect_val_a = effect_val_a.to(device_gpu)
+    
     # Helper: compute beta for the current epoch (0-based)
     def compute_beta(e):
         if warmup_epochs <= 0:
@@ -625,6 +674,36 @@ def trainModel(P, name, mode,
             return beta_start if e < beta_step_epoch else beta_end
         else:
             return beta_end  # fallback
+        
+    def make_criterion(effect_sub, use_for_val: bool):
+        """
+        Returns a callable(y_true,y_pred,cys) that applies:
+          - effect-weighted MAE if enabled and tensors provided
+          - else your existing closure_weighted_MAE
+          - else plain MAE
+        """
+        def _crit(y_true, y_pred, cys):
+            if (not use_closure_loss) or (cys is None):
+                return Metrics.MAE(y_true, y_pred)
+
+            b = compute_beta(epoch)  # tie to current epoch
+            # Prefer effect-weighted when we have a submatrix
+            if effect_sub is not None:
+                return Metrics.effect_weighted_MAE(
+                    y_true, y_pred, cys,
+                    effect_sub=effect_sub,
+                    lambda_effect=lambda_effect,
+                    use_soft=use_soft,
+                    tau=tau,
+                    beta=b if combine_with_beta else None,
+                    combine_with_beta=combine_with_beta,
+                )
+            # Fallback to your earlier closure-only weighting
+            if use_soft:
+                return Metrics.closure_soft_MAE(y_true, y_pred, cys, beta=b, tau=tau)
+            else:
+                return Metrics.closure_weighted_MAE(y_true, y_pred, cys, beta=b)
+        return _crit
 
     # Optimizer (unchanged)
     optimizer = torch.optim.Adam(model.parameters(), lr=P.learn_rate, weight_decay=P.weight_decay)
@@ -711,6 +790,7 @@ def trainModel(P, name, mode,
         starttime = datetime.now()     
         loss_sum, n = 0.0, 0
         model.train()
+        train_criterion = make_criterion(effect_train, use_for_val=False)
         for batch in model_input:
             # Support both (x,y) and (x,y,cys)
             if len(batch) == 3:
@@ -737,15 +817,7 @@ def trainModel(P, name, mode,
                 print('The corresponding second instance of y', y[0,:,1,0])
             y_pred = scaler.inverse_transform(y_pred)
             y = scaler.inverse_transform(y.to(device_gpu))
-            beta_e = compute_beta(epoch)
-            if use_closure_loss and (cys is not None):
-                if use_soft:
-                    loss = Metrics.closure_soft_MAE(y, y_pred, cys, beta=beta_e, tau=tau)
-                else:
-                    loss = Metrics.closure_weighted_MAE(y, y_pred, cys, beta=beta_e)
-            else:
-                loss = Metrics.MAE(y, y_pred)
-
+            loss = train_criterion(y, y_pred, cys)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -761,15 +833,7 @@ def trainModel(P, name, mode,
         if P.example_verbose:
             print('\nThe validation for model training starts at index', sensor_idx_start)
         # Calculate the loss for the validation set, and save the optimal model
-        def val_criterion(y_true, y_pred, cys):
-            if val_use_closure and (cys is not None):
-                b = compute_beta(epoch)   # same epoch beta for a fair comparison, or use beta_end
-                if use_soft:
-                    return Metrics.closure_soft_MAE(y_true, y_pred, cys, beta=b, tau=tau)
-                else:
-                    return Metrics.closure_weighted_MAE(y_true, y_pred, cys, beta=b)
-            else:
-                return Metrics.MAE(y_true, y_pred)
+        val_criterion = make_criterion(effect_val_a, use_for_val=val_use_closure)
         val_a_loss, Y_pred, Y = evaluateModel(P, model, val_criterion, val_a_iter, adj_val_a, val_a_embed, device_gpu, sensor_idx_start)
         if val_a_loss < min_val_a_loss:
             min_val_a_loss = val_a_loss

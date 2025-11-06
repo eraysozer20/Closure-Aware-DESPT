@@ -216,3 +216,61 @@ def closure_soft_MAE(y_true, y_pred, cys=None, beta=2.0, tau=10.0, eps=1e-6):
     return (w * (y_pred - y_true).abs()).mean()
 
 
+def effect_weighted_MAE(
+    y_true, y_pred, cys,
+    effect_sub,                 # [N_src, N_tgt] effect submatrix matching the split
+    lambda_effect=1.0,
+    use_soft=True,              # if True: timed labels; False: binary
+    tau=10.0,                   # softness for timed labels
+    beta=None,                  # scalar emphasis per epoch (e.g., from warm-up)
+    combine_with_beta='mul',    # 'mul' or 'sum' (we’ll use 'mul' semantics below)
+    w_min=1e-3,                 # optional caps to keep training stable
+    w_max=10.0
+):
+    """
+    y_true: [B, T_out, N_tgt, 1]
+    y_pred: [B, T_out, N_tgt, 1]
+    cys:    [B, T_out, N_src, 1]   # closure labels PER SOURCE sensor (same indexing as effect_sub rows)
+    effect_sub: [N_src, N_tgt]     # from P.effect_slices['train'/'val_a'/...]
+    """
+    B, T, N_tgt, _ = y_true.shape
+    _, _, N_src, _ = cys.shape
+
+    # 1) Center around 1.0 per your construction (0=big drop, >1=reroute)
+    #    We want magnitude-of-change from "normal".
+    deltaE = torch.abs(effect_sub - 1.0)  # [N_src, N_tgt]
+
+    # 2) Source activations from labels
+    if use_soft:
+        # cys = minutes-until-opening (nonnegative). Soften with exp(-t/tau).
+        a = torch.exp(-torch.clamp(cys, min=0.0) / max(tau, 1e-8))   # [B, T, N_src, 1]
+    else:
+        # binary close/open
+        a = (cys > 0).float()
+
+    a = a.squeeze(-1)                       # [B, T, N_src]
+
+    # 3) Influence per target: sum_i a_i * |E_ij - 1|
+    #    (einsum: batch/time over i, times [i,j] -> [batch,time,j])
+    # NOTE: deltaE must be on same device/dtype as y_true
+    deltaE = deltaE.to(y_true.device, y_true.dtype)
+    influence = torch.einsum('bti,ij->btj', a, deltaE)   # [B, T, N_tgt]
+
+    # 4) Build weights
+    #    w = 1 + lambda * influence  (then apply beta)
+    base = 1.0 + lambda_effect * influence                # [B, T, N_tgt]
+
+    if beta is not None:
+        if combine_with_beta == 'mul':
+            # Equivalent to w = 1 + (beta*lambda) * influence
+            base = 1.0 + beta * (base - 1.0)
+        elif combine_with_beta == 'sum':
+            base = base + beta
+        # else: ignore / already handled
+
+    w = torch.clamp(base, min=w_min, max=w_max)           # [B, T, N_tgt]
+
+    # 5) Weighted MAE over targets/timesteps/batch
+    err = torch.abs(y_true - y_pred).squeeze(-1)          # [B, T, N_tgt]
+    loss = (w * err).mean()
+    return loss
