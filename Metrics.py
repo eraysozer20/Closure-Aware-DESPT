@@ -214,3 +214,5 @@ def closure_soft_MAE(y_true, y_pred, cys=None, beta=2.0, tau=10.0, eps=1e-6):
 
     w = w / w.mean().clamp_min(eps)
     return (w * (y_pred - y_true).abs()).mean()
+
+

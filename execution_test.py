@@ -50,13 +50,23 @@ for i in range(1):
     P.is_always_augmentation = False # set to best after tuning
 
     # --- closures inputs (step 1: declare only; no loading yet) ---
-    P.add_closure_labels = False
+    P.add_closure_labels = True
     P.most_top_frac = 0.05            # top 5% farthest from 1.0
     P.include_closed_in_most = True   # allow the closed sensors themselves to be in “most”
-    P.use_closure_loss     = False
-    P.tau = 10.0
-    P.beta = 2.0
-    P.use_soft = "closure_weight_soft"
+
+    P.use_closure_loss = True                 # turn on the closure-weighted loss
+    P.closure_weight_soft = True             # False: hard mask; True: soft time-aware mask
+    P.closure_tau = 10.0                      # softness (only used when soft=True)
+
+    # Warm-up of beta (how strongly we penalize closure errors)
+    P.closure_weight_beta_start = 1.0         # start emphasis
+    P.closure_weight_beta_end   = 3.0         # final emphasis (try 2–5)
+    P.closure_warmup_epochs     = 10          # ramp length (set 0 to disable warm-up)
+    P.closure_beta_schedule     = "linear"    # "linear" | "exp" | "step"
+    P.closure_beta_step_epoch   = 5           # only used when schedule="step"
+
+    # Validation policy
+    P.val_use_closure_loss      = False       # validate with plain MAE (recommended)
 
     
     # ----------------------------------------------------------------

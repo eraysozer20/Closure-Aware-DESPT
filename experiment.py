@@ -11,9 +11,7 @@ from augmentation import *
 from model import *
 import Metrics
 from closures import (
-    build_effect_vector,
     evaluate_closure_metrics,
-    align_cys_for_eval,
 )
 import json
 from pymongo import MongoClient, UpdateOne
@@ -595,25 +593,40 @@ def trainModel(P, name, mode,
 
     model = getModel(P, name, device_gpu, len(adj_train)) # Prediction model
 
-    # training settings
+    # ===== Training settings (with closure-loss warm-up) =====
     min_val_u_loss = np.inf
     min_val_a_loss = np.inf
     final_train_loss = np.inf
     tolerance = 0
-    beta = getattr(P, "closure_weight_beta", 2.0)
-    tau  = getattr(P, "closure_tau", 10.0)
-    use_soft = getattr(P, "closure_weight_soft", False)
-    if getattr(P, "use_closure_loss", False):
-        if use_soft:
-            def criterion(y_true, y_pred, cys):
-                return Metrics.closure_soft_MAE(y_true, y_pred, cys, beta=beta, tau=tau)
+
+    # ---- Hyperparameters (read from P with safe defaults)
+    use_closure_loss   = getattr(P, "use_closure_loss", False)           # turn closure-weighted loss on/off
+    use_soft           = getattr(P, "closure_weight_soft", False)        # soft weighting using time-to-closure
+    tau                = getattr(P, "closure_tau", 10.0)                 # softness for soft weighting
+    beta_start         = getattr(P, "closure_weight_beta_start", 1.0)    # warm-up start
+    beta_end           = getattr(P, "closure_weight_beta_end",   3.0)    # warm-up end
+    warmup_epochs      = getattr(P, "closure_warmup_epochs",    10)      # epochs to reach beta_end
+    beta_schedule      = getattr(P, "closure_beta_schedule",  "linear")  # 'linear' | 'exp' | 'step'
+    beta_step_epoch    = getattr(P, "closure_beta_step_epoch",  5)       # if 'step', when to jump to beta_end
+    val_use_closure    = getattr(P, "val_use_closure_loss", False)       # use closure loss for val or plain MAE
+
+    # Helper: compute beta for the current epoch (0-based)
+    def compute_beta(e):
+        if warmup_epochs <= 0:
+            return beta_end
+        if beta_schedule == "linear":
+            t = min(1.0, e / float(warmup_epochs))
+            return beta_start + t * (beta_end - beta_start)
+        elif beta_schedule == "exp":
+            # smooth exponential ramp-up
+            t = min(1.0, e / float(warmup_epochs))
+            return beta_start * ((beta_end / max(1e-8, beta_start)) ** t)
+        elif beta_schedule == "step":
+            return beta_start if e < beta_step_epoch else beta_end
         else:
-            def criterion(y_true, y_pred, cys):
-                return Metrics.closure_weighted_MAE(y_true, y_pred, cys, beta=beta)
-    else:
-        # baseline: plain MAE, ignore cys
-        def criterion(y_true, y_pred, cys):
-            return Metrics.MAE(y_true, y_pred)
+            return beta_end  # fallback
+
+    # Optimizer (unchanged)
     optimizer = torch.optim.Adam(model.parameters(), lr=P.learn_rate, weight_decay=P.weight_decay)
     s_time = datetime.now()
 
@@ -706,7 +719,7 @@ def trainModel(P, name, mode,
             else:
                 x, y = batch
                 cys = None
-            
+
             # Apply prediction
             if P.model == 'gwnet':
                 y_pred = model(x.to(device_gpu), adj_train, train_embed, P.is_concat_encoder_model, P.is_layer_after_concat)
@@ -724,7 +737,14 @@ def trainModel(P, name, mode,
                 print('The corresponding second instance of y', y[0,:,1,0])
             y_pred = scaler.inverse_transform(y_pred)
             y = scaler.inverse_transform(y.to(device_gpu))
-            loss = criterion(y, y_pred, cys)
+            beta_e = compute_beta(epoch)
+            if use_closure_loss and (cys is not None):
+                if use_soft:
+                    loss = Metrics.closure_soft_MAE(y, y_pred, cys, beta=beta_e, tau=tau)
+                else:
+                    loss = Metrics.closure_weighted_MAE(y, y_pred, cys, beta=beta_e)
+            else:
+                loss = Metrics.MAE(y, y_pred)
 
             optimizer.zero_grad()
             loss.backward()
@@ -741,7 +761,16 @@ def trainModel(P, name, mode,
         if P.example_verbose:
             print('\nThe validation for model training starts at index', sensor_idx_start)
         # Calculate the loss for the validation set, and save the optimal model
-        val_a_loss, Y_pred, Y = evaluateModel(P, model, criterion, val_a_iter, adj_val_a, val_a_embed, device_gpu, sensor_idx_start)
+        def val_criterion(y_true, y_pred, cys):
+            if val_use_closure and (cys is not None):
+                b = compute_beta(epoch)   # same epoch beta for a fair comparison, or use beta_end
+                if use_soft:
+                    return Metrics.closure_soft_MAE(y_true, y_pred, cys, beta=b, tau=tau)
+                else:
+                    return Metrics.closure_weighted_MAE(y_true, y_pred, cys, beta=b)
+            else:
+                return Metrics.MAE(y_true, y_pred)
+        val_a_loss, Y_pred, Y = evaluateModel(P, model, val_criterion, val_a_iter, adj_val_a, val_a_embed, device_gpu, sensor_idx_start)
         if val_a_loss < min_val_a_loss:
             min_val_a_loss = val_a_loss
             final_train_loss = train_loss
