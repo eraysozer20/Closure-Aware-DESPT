@@ -126,6 +126,24 @@ def setups(P, device):
     print('testYS.shape', testYS.shape)
 
 
+    if getattr(P, 'has_closure_labels', False):
+        # closure_mask: [T_total, N_sensor] (already loaded in main)
+        closure_mask = P.closure_mask
+
+        # Same temporal split as getXSYS: train + val part
+        TRAIN_NUM = int(closure_mask.shape[0] * (P.t_train + P.t_val))
+        train_clos = closure_mask[:TRAIN_NUM, :]          # [T_trainval, N]
+
+        # has_train_closure[j] = True if sensor j ever closed in train+val
+        has_train_closure = (train_clos > 0).any(axis=0)  # numpy bool array [N]
+
+        # unseen_closure_flag[j] = 1 if sensor j NEVER closed in train+val
+        P.unseen_closure_flag = (~has_train_closure).astype(np.int8)
+
+        print("\n[Unseen-closure flag]")
+        print("  sensors with NO closure in train+val:",
+                int(P.unseen_closure_flag.sum()), "/", P.n_sensor)
+
     if P.example_verbose:
         print('\nFirst instance trainXS for first sensor:', trainXS[0,0,0,:])
         print('\nFirst instance trainYS for first sensor:', trainYS[0,:,0,0])
@@ -177,6 +195,19 @@ def setups(P, device):
         print('spatialSplit_allNod.i_trn', spatialSplit_allNod.i_trn)
         print('spatialSplit_allNod.i_val', spatialSplit_allNod.i_val)
         print('spatialSplit_allNod.i_tst', spatialSplit_allNod.i_tst)
+
+    if getattr(P, 'has_closure_labels', False) and hasattr(P, 'unseen_closure_flag'):
+        flag_full = P.unseen_closure_flag  # [N_sensor] in original order
+
+        # same ordering as adj / XS_torch_* built with spatialSplit_allNod
+        P.unseen_closure_flag_trn = flag_full[spatialSplit_allNod.i_trn]
+        P.unseen_closure_flag_val = flag_full[spatialSplit_allNod.i_val]
+        P.unseen_closure_flag_tst = flag_full[spatialSplit_allNod.i_tst]
+
+        print("\n[Unseen-closure flag per split]")
+        print("  train:", int(P.unseen_closure_flag_trn.sum()),
+                " val:",  int(P.unseen_closure_flag_val.sum()),
+                " test:", int(P.unseen_closure_flag_tst.sum()))
 
     P.effect_slices = None
     try:
@@ -1126,6 +1157,61 @@ def testModel(P, name, mode, test_iter, adj_tst, spatialsplit, device_cpu, devic
             top_frac=getattr(P, 'most_top_frac', 0.05)           # if you use top-% most logic
         )
 
+        # ==========================
+        # Unseen-vs-seen closure sensors
+        # ==========================
+        unseen_flag_tst = getattr(P, 'unseen_closure_flag_tst', None)
+        if unseen_flag_tst is not None:
+            # unseen_flag_tst is in full test sensor order; we only evaluate from sensor_idx_start
+            unseen_flag_eval = unseen_flag_tst[sensor_idx_start:]        # [N_eff]
+            unseen_flag_eval = torch.from_numpy(unseen_flag_eval).to(YS.device).bool()
+
+            # CYS_aligned has shape [B, T, N_eff, 1]; >0 means closure
+            cys_eval = CYS_aligned  # [B, T, N_eff, 1]
+            closed_mask = (cys_eval > 0).squeeze(-1)                     # [B, T, N_eff]
+
+            # Broadcast sensor flags to [B, T, N_eff]
+            flag_broadcast = unseen_flag_eval.view(1, 1, -1)            # [1,1,N_eff]
+
+            mask_unseen = closed_mask & flag_broadcast                   # closures on unseen-closure sensors
+            mask_seen   = closed_mask & (~flag_broadcast)                # closures on seen-closure sensors
+
+            unseen_metrics = Metrics.evaluate_masked(YS, YS_pred, mask_unseen)
+            seen_metrics   = Metrics.evaluate_masked(YS, YS_pred, mask_seen)
+
+            print('\n[Unseen/seen closure-sensor metrics]')
+            if unseen_metrics is None:
+                print('  closure-unseenSens  N=0')
+            else:
+                umse, urmse, umae, umape = unseen_metrics
+                print(f'  closure-unseenSens MSE={umse:.6f} RMSE={urmse:.6f} MAE={umae:.6f} MAPE={umape:.6f}')
+            if seen_metrics is None:
+                print('  closure-seenSens   N=0')
+            else:
+                smse, srmse, smae, smape = seen_metrics
+                print(f'  closure-seenSens  MSE={smse:.6f} RMSE={srmse:.6f} MAE={smae:.6f} MAPE={smape:.6f}')
+
+            # Optionally write to results.csv
+            try:
+                df = pd.read_csv('save/results.csv')
+                rowmask = (df['exe_id'] == P.exe_id)
+                if unseen_metrics is not None:
+                    umse, urmse, umae, umape = unseen_metrics
+                    df.loc[rowmask, mode+'_closure_unseenSens_MSE']  = float(umse)
+                    df.loc[rowmask, mode+'_closure_unseenSens_RMSE'] = float(urmse)
+                    df.loc[rowmask, mode+'_closure_unseenSens_MAE']  = float(umae)
+                    df.loc[rowmask, mode+'_closure_unseenSens_MAPE'] = float(umape)
+                if seen_metrics is not None:
+                    smse, srmse, smae, smape = seen_metrics
+                    df.loc[rowmask, mode+'_closure_seenSens_MSE']  = float(smse)
+                    df.loc[rowmask, mode+'_closure_seenSens_RMSE'] = float(srmse)
+                    df.loc[rowmask, mode+'_closure_seenSens_MAE']  = float(smae)
+                    df.loc[rowmask, mode+'_closure_seenSens_MAPE'] = float(smape)
+                df.to_csv('save/results.csv', index=False)
+            except Exception:
+                pass
+
+
         # Pretty-print (unchanged)
         def _p(name, tup):
             if tup is None:
@@ -1374,6 +1460,51 @@ def main(P):
         P.closure_mask = closure_mask     
         P.effect_matrix_path = './data/SIM_GRID/5DAY_COT/closure_effect.pkl'
         P.closure_mode = 'binary'   # 'time' or 'binary' 
+    elif P.dataname == '2MON_COTR0TE20D12_36':
+        print('P.dataname == 2MON_COTR0TE20D12_36')
+        data_path = './data/SIM_GRID/2MON_COTR0TE20D12_36/sensor_readings.h5'
+        if P.adj_method == 0:
+            P.adj_path = './data/SIM_GRID/2MON_COTR0TE20D12_36/adj_mx_diag0.pkl'
+        elif P.adj_method == 1:
+            P.adj_path = './data/SIM_GRID/2MON_COTR0TE20D12_36/adj_mx_diag1.pkl'
+        P.n_sensor = 120
+        data = pd.read_hdf(data_path).values
+        P.has_closure_labels = True
+        P.closure_mask_path = './data/SIM_GRID/2MON_COTR0TE20D12_36/closure_labels.h5' 
+        closure_mask = pd.read_hdf(P.closure_mask_path).values
+        P.closure_mask = closure_mask     
+        P.effect_matrix_path = './data/SIM_GRID/2MON_COTR0TE20D12_36/closure_effect.pkl'
+        P.closure_mode = 'time'   # 'time' or 'binary' 
+    elif P.dataname == '2MON_COTR10TE20D12_36':
+        print('P.dataname == 2MON_COTR10TE20D12_36')
+        data_path = './data/SIM_GRID/2MON_COTR10TE20D12_36/sensor_readings.h5'
+        if P.adj_method == 0:
+            P.adj_path = './data/SIM_GRID/2MON_COTR10TE20D12_36/adj_mx_diag0.pkl'
+        elif P.adj_method == 1:
+            P.adj_path = './data/SIM_GRID/2MON_COTR10TE20D12_36/adj_mx_diag1.pkl'
+        P.n_sensor = 120
+        data = pd.read_hdf(data_path).values
+        P.has_closure_labels = True
+        P.closure_mask_path = './data/SIM_GRID/2MON_COTR10TE20D12_36/closure_labels.h5' 
+        closure_mask = pd.read_hdf(P.closure_mask_path).values
+        P.closure_mask = closure_mask     
+        P.effect_matrix_path = './data/SIM_GRID/2MON_COTR10TE20D12_36/closure_effect.pkl'
+        P.closure_mode = 'time'   # 'time' or 'binary' 
+    elif P.dataname == '2MON_COTR20TE20D12_24':
+        print('P.dataname == 2MON_COTR20TE20D12_24')
+        data_path = './data/SIM_GRID/2MON_COTR20TE20D12_24/sensor_readings.h5'
+        if P.adj_method == 0:
+            P.adj_path = './data/SIM_GRID/2MON_COTR20TE20D12_24/adj_mx_diag0.pkl'
+        elif P.adj_method == 1:
+            P.adj_path = './data/SIM_GRID/2MON_COTR20TE20D12_24/adj_mx_diag1.pkl'
+        P.n_sensor = 120
+        data = pd.read_hdf(data_path).values
+        P.has_closure_labels = True
+        P.closure_mask_path = './data/SIM_GRID/2MON_COTR20TE20D12_24/closure_labels.h5' 
+        closure_mask = pd.read_hdf(P.closure_mask_path).values
+        P.closure_mask = closure_mask     
+        P.effect_matrix_path = './data/SIM_GRID/2MON_COTR20TE20D12_24/closure_effect.pkl'
+        P.closure_mode = 'time'   # 'time' or 'binary' 
     elif P.dataname == 'HAGUE_FULL':
         print('P.dataname == HAGUE_FULL')
         data_path = './data/Hauge/hague_filled.h5'

@@ -5,7 +5,7 @@ track_id = 9023 # set the start of the track id, each iteration will increase th
 for i in range(1):
     os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
     P = type('Parameters', (object,), {})()
-    P.dataname = 'SIM_GRID_2MON_C' # dataset name
+    P.dataname = '2MON_COTR20TE20D12_24' # dataset name
     P.model = 'gwnet' # model name, could be 'gwnet' or 'lstm', 'gwnet' is the default model in the paper
     P.pre_model = 'COST' # pretrain model framework options, could be 'COST' (STD) or 'TCN' (regular)
     P.track_id = track_id
