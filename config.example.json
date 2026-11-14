@@ -1,0 +1,6 @@
+{
+  "username": "YOUR_MONGODB_USERNAME",
+  "password": "YOUR_MONGODB_PASSWORD",
+  "cluster_url": "your-cluster.mongodb.net",
+  "db_name": "PEMSD7"
+}
